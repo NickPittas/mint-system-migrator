@@ -14,9 +14,9 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 try:
-    from .config_discovery import ConfigDiscovery
+    from .config_discovery import SmartConfigDiscovery
 except ImportError:
-    from config_discovery import ConfigDiscovery
+    from config_discovery import SmartConfigDiscovery
 
 
 @dataclass
@@ -85,6 +85,9 @@ class ConfigBackup:
         try:
             self.progress(0, "Discovering config files...")
 
+            # Create discovery instance
+            discovery = SmartConfigDiscovery()
+
             # Collect all config files per app
             all_configs: Dict[str, List[str]] = {}
             apps_without_configs = []
@@ -99,31 +102,28 @@ class ConfigBackup:
                     continue
 
                 # Discover configs for this app
-                configs = ConfigDiscovery.discover_configs(app_name)
+                configs = discovery.discover_configs(app_name)
 
                 if configs:
-                    # Store just the file paths (not the is_file flag - we verify later)
+                    # configs is now list of (path, size) tuples
                     all_configs[app_name] = [c[0] for c in configs]
-                    self.log(f"  {app_name}: {len(configs)} config files")
+                    total_kb = sum(c[1] for c in configs) / 1024
+                    self.log(
+                        f"  {app_name}: {len(configs)} config files ({total_kb:.1f} KB)"
+                    )
                 else:
                     apps_without_configs.append(app_name)
 
             if include_global:
                 self.progress(10, "Discovering global configs...")
                 global_configs = []
-                for pattern, _ in ConfigDiscovery.GLOBAL_PATTERNS:
-                    expanded = Path(pattern).expanduser()
-                    if expanded.exists():
-                        if expanded.is_file():
-                            global_configs.append(str(expanded))
-                        elif expanded.is_dir():
-                            # Only include files, not subdirectories
-                            for item in expanded.rglob("*"):
-                                if self.cancelled:
-                                    result.error_message = "Cancelled by user"
-                                    return result
-                                if item.is_file():
-                                    global_configs.append(str(item))
+
+                # Get global configs using discovery
+                global_summary = discovery.get_user_configs_summary()
+                for category, configs in global_summary.items():
+                    for path, size in configs:
+                        if path not in global_configs:
+                            global_configs.append(path)
 
                 if global_configs:
                     all_configs["_global"] = global_configs
