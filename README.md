@@ -17,11 +17,11 @@ A PyQt6 GUI application to scan, backup, and restore Linux Mint system configura
 ```bash
 # Download the .deb from releases
 cd ~/Downloads
-sudo apt install ./mint-system-migrator_1.0.3_all.deb
+sudo apt install ./mint-system-migrator_1.0.5_all.deb
 
 # Or install from GitHub release
-wget https://github.com/NickPittas/mint-system-migrator/releases/download/v1.0.3/mint-system-migrator_1.0.3_all.deb
-sudo apt install ./mint-system-migrator_1.0.3_all.deb
+wget https://github.com/NickPittas/mint-system-migrator/releases/download/v1.0.5/mint-system-migrator_1.0.5_all.deb
+sudo apt install ./mint-system-migrator_1.0.5_all.deb
 ```
 
 The app will appear in your applications menu under **System Tools**.

@@ -61,9 +61,38 @@ class SmartConfigDiscovery:
         "games",
     }
 
+    EXCLUDED_DIR_PARTS = {
+        "cache",
+        "log",
+        "crash",
+        "tmp",
+        "temp",
+        "session",
+        "history",
+        "backup",
+        "storage",
+        "snapshot",
+        "download",
+        "registry",
+        "update",
+        "test",
+        "docs",
+        "doc",
+        "example",
+        "examples",
+        "bin",
+        "man",
+        "source",
+        "src",
+    }
+
     EXCLUDED_FILE_NAMES = {
         ".ds_store",
         "thumbs.db",
+        ".gitignore",
+        ".gitattributes",
+        ".gitmodules",
+        ".git-credentials",
     }
 
     EXCLUDED_SUFFIXES = {
@@ -112,6 +141,59 @@ class SmartConfigDiscovery:
         ".sqlite3",
     }
 
+    STRICT_DATA_EXTENSIONS = {
+        ".conf",
+        ".cfg",
+        ".ini",
+        ".json",
+        ".jsonc",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".xml",
+        ".desktop",
+        ".theme",
+        ".lua",
+        ".vim",
+        ".rc",
+        ".py",
+        ".nk",
+        ".pref",
+    }
+
+    CONFIG_NAME_KEYWORDS = {
+        "config",
+        "settings",
+        "prefs",
+        "pref",
+        "preferences",
+        "theme",
+        "themes",
+        "shortcut",
+        "shortcuts",
+        "workspace",
+        "workspaces",
+        "preset",
+        "presets",
+        "toolset",
+        "toolsets",
+        "menu",
+        "init",
+        "plugin",
+        "plugins",
+        "validator",
+        "profile",
+        "profiles",
+        "keybinding",
+        "keybindings",
+        "auth",
+        "token",
+        "model",
+        "bookmarks",
+        "registry",
+        "ocio",
+    }
+
     GENERIC_TOKENS = {
         "desktop",
         "stable",
@@ -149,9 +231,13 @@ class SmartConfigDiscovery:
         for path in self._discover_home_entries(aliases):
             results.extend(self._collect_from_path(path, found))
 
-        for root in (self.xdg_config, self.xdg_data, self.xdg_state):
+        for root in (self.xdg_config,):
             for path in self._discover_root_entries(root, aliases):
                 results.extend(self._collect_from_path(path, found))
+
+        for root in (self.xdg_data, self.xdg_state):
+            for path in self._discover_root_entries(root, aliases):
+                results.extend(self._collect_data_path(path, found))
 
         return sorted(results, key=lambda item: item[0].lower())
 
@@ -223,7 +309,9 @@ class SmartConfigDiscovery:
             if child.is_dir():
                 try:
                     for grandchild in child.iterdir():
-                        if self._matches_name(grandchild.name, aliases):
+                        if grandchild.is_dir() and self._matches_name(
+                            grandchild.name, aliases
+                        ):
                             yield grandchild
                 except OSError:
                     continue
@@ -237,9 +325,14 @@ class SmartConfigDiscovery:
             normalized_name == alias
             or normalized_name.startswith(alias)
             or normalized_name.startswith(alias + " ")
-            or normalized_name.endswith(alias)
-            or alias in tokens
-            or any(token.startswith(alias) for token in tokens)
+            or (
+                len(alias) >= 5
+                and (
+                    normalized_name.endswith(alias)
+                    or alias in tokens
+                    or any(token.startswith(alias) for token in tokens)
+                )
+            )
             for alias in aliases
         )
 
@@ -250,6 +343,9 @@ class SmartConfigDiscovery:
         if not path.is_dir():
             return []
 
+        if (path / ".git").exists():
+            return []
+
         results: List[ConfigEntry] = []
         for root, dirs, files in os.walk(path):
             dirs[:] = [
@@ -258,9 +354,34 @@ class SmartConfigDiscovery:
                 if not self._is_excluded_dir_name(directory)
             ]
             root_path = Path(root)
+            if (root_path / ".git").exists():
+                dirs[:] = []
+                continue
             for file_name in files:
                 child = root_path / file_name
                 results.extend(self._collect_file(child, found))
+        return results
+
+    def _collect_data_path(self, path: Path, found: Set[str]) -> List[ConfigEntry]:
+        if path.is_file():
+            return self._collect_data_file(path, found)
+
+        if not path.is_dir():
+            return []
+
+        results: List[ConfigEntry] = []
+        base_depth = len(path.parts)
+        for root, dirs, files in os.walk(path):
+            root_path = Path(root)
+            depth = len(root_path.parts) - base_depth
+            dirs[:] = [
+                directory
+                for directory in dirs
+                if not self._is_excluded_dir_name(directory) and depth < 2
+            ]
+            for file_name in files:
+                child = root_path / file_name
+                results.extend(self._collect_data_file(child, found))
         return results
 
     def _collect_file(self, path: Path, found: Set[str]) -> List[ConfigEntry]:
@@ -285,6 +406,21 @@ class SmartConfigDiscovery:
         if path_str in found:
             return []
         if not self._is_global_config_file(path):
+            return []
+
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return []
+
+        found.add(path_str)
+        return [(path_str, size)]
+
+    def _collect_data_file(self, path: Path, found: Set[str]) -> List[ConfigEntry]:
+        path_str = str(path)
+        if path_str in found:
+            return []
+        if not self._is_data_config_file(path):
             return []
 
         try:
@@ -345,7 +481,37 @@ class SmartConfigDiscovery:
         if name.startswith(".") and self._looks_like_text(path):
             return True
 
+        if suffix in {".py", ".nk", ".pref"} and self._has_config_keyword(name):
+            return True
+
         return False
+
+    def _is_data_config_file(self, path: Path) -> bool:
+        try:
+            if not path.is_file():
+                return False
+            size = path.stat().st_size
+        except OSError:
+            return False
+
+        if size > self.MAX_FILE_SIZE:
+            return False
+        if any(self._is_excluded_dir_name(part) for part in path.parts[:-1]):
+            return False
+
+        suffix = path.suffix.lower()
+        name = path.name.lower()
+
+        if name in self.EXCLUDED_FILE_NAMES:
+            return False
+        if suffix in self.EXCLUDED_SUFFIXES:
+            return False
+        if any(part in name for part in self.EXCLUDED_NAME_PARTS):
+            return False
+        if suffix not in self.STRICT_DATA_EXTENSIONS:
+            return False
+
+        return self._has_config_keyword(name)
 
     def _is_global_config_file(self, path: Path) -> bool:
         try:
@@ -483,10 +649,16 @@ class SmartConfigDiscovery:
         return self._is_excluded_dir_name(path.name)
 
     def _is_excluded_dir_name(self, name: str) -> bool:
+        normalized = self._normalize(name)
         return (
             name.lower() in self.EXCLUDED_DIRS
-            or self._normalize(name) in self.EXCLUDED_DIRS
+            or normalized in self.EXCLUDED_DIRS
+            or any(part in normalized for part in self.EXCLUDED_DIR_PARTS)
         )
+
+    def _has_config_keyword(self, name: str) -> bool:
+        normalized = self._normalize(name)
+        return any(keyword in normalized for keyword in self.CONFIG_NAME_KEYWORDS)
 
     @staticmethod
     def _normalize(value: str) -> str:
