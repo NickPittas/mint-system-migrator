@@ -1,456 +1,494 @@
 #!/usr/bin/env python3
 """
-Smart Config Discovery - Discovers ONLY config files, never application data
-Scans specific locations known to contain configs
+Live config discovery for selected applications.
+
+This module does not keep a per-app hardcoded map.
+It scans the user's filesystem at runtime and finds candidate config files
+for the selected apps under common config roots.
 """
 
+from __future__ import annotations
+
+import glob
 import os
-import subprocess
+import re
 from pathlib import Path
-from typing import List, Dict, Set, Tuple
-import fnmatch
+from typing import Iterable, List, Set, Tuple
+
+
+ConfigEntry = Tuple[str, int]
 
 
 class SmartConfigDiscovery:
-    """Discovers config files intelligently, avoiding data directories"""
+    """Discover config files dynamically from the live filesystem."""
 
-    def __init__(self):
+    EXCLUDED_DIRS = {
+        "__pycache__",
+        ".git",
+        ".github",
+        ".hg",
+        ".svn",
+        ".cache",
+        "cache",
+        "cache2",
+        "cacheddata",
+        "code cache",
+        "gpucache",
+        "blob_storage",
+        "logs",
+        "log",
+        "tmp",
+        "temp",
+        "crashpad",
+        "crashes",
+        "service worker",
+        "session storage",
+        "sessions",
+        "indexeddb",
+        "dawncache",
+        "shadercache",
+        "node_modules",
+        "vendor",
+        "doc",
+        "docs",
+        "venv",
+        ".venv",
+        "toolchains",
+        "registry",
+        "update hashes",
+        "downloads",
+        "steamapps",
+        "games",
+    }
+
+    EXCLUDED_FILE_NAMES = {
+        ".ds_store",
+        "thumbs.db",
+    }
+
+    EXCLUDED_SUFFIXES = {
+        ".log",
+        ".lock",
+        ".bak",
+        ".backup",
+        ".old",
+        ".pid",
+        ".tmp",
+        ".temp",
+        ".cache",
+        ".journal",
+    }
+
+    EXCLUDED_NAME_PARTS = {
+        "cache",
+        "log",
+        "crash",
+        "lock",
+        "tmp",
+        "temp",
+        "journal",
+        "history",
+        "backup",
+    }
+
+    ALLOWED_EXTENSIONS = {
+        ".conf",
+        ".cfg",
+        ".ini",
+        ".json",
+        ".jsonc",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".xml",
+        ".lua",
+        ".vim",
+        ".vdf",
+        ".desktop",
+        ".theme",
+        ".rc",
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+    }
+
+    GENERIC_TOKENS = {
+        "desktop",
+        "stable",
+        "studio",
+        "browser",
+        "community",
+        "edition",
+        "client",
+        "server",
+        "gtk",
+        "qt",
+        "cli",
+        "gui",
+        "ce",
+    }
+
+    MAX_FILE_SIZE = 20 * 1024 * 1024
+    MAX_TEXT_PROBE = 4096
+
+    def __init__(self) -> None:
         self.home = Path.home()
         self.xdg_config = Path(os.environ.get("XDG_CONFIG_HOME", self.home / ".config"))
         self.xdg_data = Path(
             os.environ.get("XDG_DATA_HOME", self.home / ".local" / "share")
         )
+        self.xdg_state = Path(
+            os.environ.get("XDG_STATE_HOME", self.home / ".local" / "state")
+        )
 
-    def discover_configs(self, app_name: str) -> List[Tuple[str, int]]:
-        """
-        Discover config files for an application
-        Returns list of (path, size_bytes) - ONLY actual config files
-        """
-        configs = []
-        found_paths: Set[str] = set()
+    def discover_configs(self, app_name: str) -> List[ConfigEntry]:
+        aliases = self._aliases(app_name)
+        found: Set[str] = set()
+        results: List[ConfigEntry] = []
 
-        app_lower = app_name.lower()
+        for path in self._discover_home_entries(aliases):
+            results.extend(self._collect_from_path(path, found))
 
-        # Strategy 1: Check home directory dotfiles
-        configs.extend(self._scan_dotfiles(app_lower, found_paths))
+        for root in (self.xdg_config, self.xdg_data, self.xdg_state):
+            for path in self._discover_root_entries(root, aliases):
+                results.extend(self._collect_from_path(path, found))
 
-        # Strategy 2: Check ~/.config/
-        configs.extend(self._scan_config_dir(app_lower, found_paths))
+        return sorted(results, key=lambda item: item[0].lower())
 
-        # Strategy 3: Check ~/.local/share/ for specific config files
-        configs.extend(self._scan_local_share(app_lower, found_paths))
+    def get_global_configs(self) -> List[ConfigEntry]:
+        found: Set[str] = set()
+        results: List[ConfigEntry] = []
 
-        # Strategy 4: App-specific logic
-        configs.extend(self._app_specific_scan(app_lower, found_paths))
-
-        return configs
-
-    def _scan_dotfiles(
-        self, app_name: str, found_paths: Set[str]
-    ) -> List[Tuple[str, int]]:
-        """Scan home directory for dotfiles - ONLY specific patterns, not recursive"""
-        configs = []
-
-        # Specific dotfile patterns to check
-        dotfile_patterns = [
-            f".{app_name}rc",
-            f".{app_name}.conf",
-            f".{app_name}.config",
-            f".{app_name}.toml",
-            f".{app_name}.yaml",
-            f".{app_name}.yml",
-            f".{app_name}.json",
-            f".{app_name}.ini",
-            f".{app_name}",
+        global_roots = [
+            self.home / ".themes",
+            self.home / ".icons",
+            self.home / ".fonts",
+            self.xdg_config / "fontconfig",
+            self.home / ".local" / "share" / "applications",
         ]
 
-        # Also check common variations
-        if app_name == "zsh":
-            dotfile_patterns.extend(
-                [".zshrc", ".zprofile", ".zshenv", ".zlogin", ".zlogout", ".p10k.zsh"]
-            )
-        elif app_name == "bash":
-            dotfile_patterns.extend(
-                [
-                    ".bashrc",
-                    ".bash_profile",
-                    ".bash_aliases",
-                    ".profile",
-                    ".bash_logout",
+        for root in global_roots:
+            if not root.exists():
+                continue
+            if root.is_file():
+                results.extend(self._collect_global_file(root, found))
+                continue
+            for base, dirs, files in os.walk(root):
+                dirs[:] = [
+                    directory
+                    for directory in dirs
+                    if not self._is_excluded_dir_name(directory)
                 ]
-            )
-        elif app_name == "vim":
-            dotfile_patterns.extend([".vimrc", ".viminfo"])
-        elif app_name == "git":
-            dotfile_patterns.extend([".gitconfig", ".gitignore_global"])
-        elif app_name == "ssh":
-            dotfile_patterns.extend([".ssh/config"])
-        elif app_name == "fzf":
-            dotfile_patterns.extend([".fzf.bash", ".fzf.zsh"])
-        elif app_name == "zoxide":
-            dotfile_patterns.extend([".zoxide.toml"])
-        elif app_name == "cargo":
-            dotfile_patterns.extend([".cargo/config", ".cargo/config.toml"])
-        elif app_name == "rustup":
-            dotfile_patterns.extend([".rustup/settings.toml"])
+                base_path = Path(base)
+                for file_name in files:
+                    results.extend(
+                        self._collect_global_file(base_path / file_name, found)
+                    )
 
-        for pattern in dotfile_patterns:
-            path = self.home / pattern
-            if path.exists() and path.is_file():
-                path_str = str(path)
-                if path_str not in found_paths:
-                    size = path.stat().st_size
-                    if size < 10 * 1024 * 1024:  # Skip if > 10MB
-                        configs.append((path_str, size))
-                        found_paths.add(path_str)
+        return sorted(results, key=lambda item: item[0].lower())
 
-        return configs
+    def _aliases(self, app_name: str) -> Set[str]:
+        raw = app_name.strip().lower()
+        normalized = self._normalize(raw)
+        aliases = {raw, normalized}
 
-    def _scan_config_dir(
-        self, app_name: str, found_paths: Set[str]
-    ) -> List[Tuple[str, int]]:
-        """Scan ~/.config/ for app configs - specific files only"""
-        configs = []
+        parts = [p for p in normalized.split() if p and p not in self.GENERIC_TOKENS]
+        aliases.update(parts)
+        if parts:
+            aliases.add(" ".join(parts))
+            aliases.add("".join(parts))
 
-        if not self.xdg_config.exists():
-            return configs
+        return {alias for alias in aliases if len(alias) >= 2}
 
-        # Look for app directory in ~/.config/
-        app_dir = self.xdg_config / app_name
+    def _discover_home_entries(self, aliases: Set[str]) -> Iterable[Path]:
+        try:
+            for child in self.home.iterdir():
+                if self._matches_name(child.name, aliases):
+                    yield child
+        except OSError:
+            return
 
-        # Also check capitalized version
-        app_dir_cap = self.xdg_config / app_name.capitalize()
+    def _discover_root_entries(self, root: Path, aliases: Set[str]) -> Iterable[Path]:
+        if not root.exists() or not root.is_dir():
+            return
 
-        for directory in [app_dir, app_dir_cap]:
-            if directory.exists() and directory.is_dir():
-                # Only look for specific config files, NOT recursively
-                config_files = [
-                    "config",
-                    "config.toml",
-                    "config.yaml",
-                    "config.yml",
-                    "config.json",
-                    "settings.json",
-                    "settings.toml",
-                    "settings.yaml",
-                    "init.lua",
-                    "init.vim",
-                    "init.el",
-                    "kitty.conf",
-                    "alacritty.yml",
-                    "alacritty.toml",
-                ]
+        try:
+            first_level = list(root.iterdir())
+        except OSError:
+            return
 
-                for config_name in config_files:
-                    config_path = directory / config_name
-                    if config_path.exists() and config_path.is_file():
-                        path_str = str(config_path)
-                        if path_str not in found_paths:
-                            size = config_path.stat().st_size
-                            if size < 10 * 1024 * 1024:
-                                configs.append((path_str, size))
-                                found_paths.add(path_str)
+        for child in first_level:
+            if self._matches_name(child.name, aliases):
+                yield child
+            if child.is_dir():
+                try:
+                    for grandchild in child.iterdir():
+                        if self._matches_name(grandchild.name, aliases):
+                            yield grandchild
+                except OSError:
+                    continue
 
-                # For some apps, also check subdirectories but limit depth
-                if app_name in [
-                    "nvim",
-                    "neovim",
-                    "vim",
-                    "kitty",
-                    "alacritty",
-                    "code",
-                    "vscode",
-                ]:
-                    for subitem in directory.iterdir():
-                        if subitem.is_file() and subitem.suffix in [
-                            ".lua",
-                            ".vim",
-                            ".json",
-                            ".toml",
-                            ".yml",
-                            ".yaml",
-                            ".conf",
-                        ]:
-                            path_str = str(subitem)
-                            if path_str not in found_paths:
-                                size = subitem.stat().st_size
-                                if size < 10 * 1024 * 1024:
-                                    configs.append((path_str, size))
-                                    found_paths.add(path_str)
-                        elif subitem.is_dir() and subitem.name.lower() in [
-                            "lua",
-                            "plugin",
-                            "colors",
-                            "syntax",
-                            "ftplugin",
-                            "snippets",
-                        ]:
-                            # One level deep only for specific directories
-                            for subfile in subitem.iterdir():
-                                if subfile.is_file():
-                                    path_str = str(subfile)
-                                    if path_str not in found_paths:
-                                        size = subfile.stat().st_size
-                                        if size < 10 * 1024 * 1024:
-                                            configs.append((path_str, size))
-                                            found_paths.add(path_str)
+    def _matches_name(self, name: str, aliases: Set[str]) -> bool:
+        normalized_name = self._normalize(name)
+        if not normalized_name:
+            return False
+        tokens = normalized_name.split()
+        return any(
+            normalized_name == alias
+            or normalized_name.startswith(alias)
+            or normalized_name.startswith(alias + " ")
+            or normalized_name.endswith(alias)
+            or alias in tokens
+            or any(token.startswith(alias) for token in tokens)
+            for alias in aliases
+        )
 
-        return configs
+    def _collect_from_path(self, path: Path, found: Set[str]) -> List[ConfigEntry]:
+        if path.is_file():
+            return self._collect_file(path, found)
 
-    def _scan_local_share(
-        self, app_name: str, found_paths: Set[str]
-    ) -> List[Tuple[str, int]]:
-        """Scan ~/.local/share/ for specific config files"""
-        configs = []
+        if not path.is_dir():
+            return []
 
-        if not self.xdg_data.exists():
-            return configs
+        results: List[ConfigEntry] = []
+        for root, dirs, files in os.walk(path):
+            dirs[:] = [
+                directory
+                for directory in dirs
+                if not self._is_excluded_dir_name(directory)
+            ]
+            root_path = Path(root)
+            for file_name in files:
+                child = root_path / file_name
+                results.extend(self._collect_file(child, found))
+        return results
 
-        app_dir = self.xdg_data / app_name
+    def _collect_file(self, path: Path, found: Set[str]) -> List[ConfigEntry]:
+        path_str = str(path)
+        if path_str in found:
+            return []
+        if not self._is_config_file(path):
+            return []
 
-        if app_dir.exists() and app_dir.is_dir():
-            # Only look for specific config files, not the whole directory
-            config_names = ["settings.json", "config.json", "prefs.js", "settings.toml"]
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return []
 
-            for config_name in config_names:
-                config_path = app_dir / config_name
-                if config_path.exists() and config_path.is_file():
-                    path_str = str(config_path)
-                    if path_str not in found_paths:
-                        size = config_path.stat().st_size
-                        if size < 10 * 1024 * 1024:
-                            configs.append((path_str, size))
-                            found_paths.add(path_str)
+        found.add(path_str)
+        results = [(path_str, size)]
+        results.extend(self._collect_referenced_paths(path, found))
+        return results
 
-        return configs
+    def _collect_global_file(self, path: Path, found: Set[str]) -> List[ConfigEntry]:
+        path_str = str(path)
+        if path_str in found:
+            return []
+        if not self._is_global_config_file(path):
+            return []
 
-    def _app_specific_scan(
-        self, app_name: str, found_paths: Set[str]
-    ) -> List[Tuple[str, int]]:
-        """App-specific config locations"""
-        configs = []
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return []
 
-        # Define app-specific config paths
-        app_configs = {
-            "zsh": [
-                self.home / ".zshrc",
-                self.home / ".zprofile",
-                self.home / ".zshenv",
-                self.home / ".zlogin",
-                self.home / ".zlogout",
-                self.home / ".p10k.zsh",
-                self.home / ".oh-my-zsh" / "custom" / "custom.zsh",
-            ],
-            "bash": [
-                self.home / ".bashrc",
-                self.home / ".bash_profile",
-                self.home / ".bash_aliases",
-                self.home / ".profile",
-                self.home / ".bash_logout",
-            ],
-            "kitty": [
-                self.xdg_config / "kitty" / "kitty.conf",
-                self.xdg_config / "kitty" / "current-theme.conf",
-            ],
-            "alacritty": [
-                self.xdg_config / "alacritty" / "alacritty.yml",
-                self.xdg_config / "alacritty" / "alacritty.toml",
-            ],
-            "fzf": [
-                self.home / ".fzf.bash",
-                self.home / ".fzf.zsh",
-            ],
-            "zoxide": [
-                self.home / ".zoxide.toml",
-            ],
-            "nvim": [
-                self.xdg_config / "nvim" / "init.lua",
-                self.xdg_config / "nvim" / "init.vim",
-            ],
-            "neovim": [
-                self.xdg_config / "nvim" / "init.lua",
-                self.xdg_config / "nvim" / "init.vim",
-            ],
-            "vim": [
-                self.home / ".vimrc",
-                self.home / ".viminfo",
-            ],
-            "git": [
-                self.home / ".gitconfig",
-                self.home / ".gitignore_global",
-            ],
-            "ssh": [
-                self.home / ".ssh" / "config",
-            ],
-            "cargo": [
-                self.home / ".cargo" / "config",
-                self.home / ".cargo" / "config.toml",
-            ],
-            "rustup": [
-                self.home / ".rustup" / "settings.toml",
-            ],
-            "docker": [
-                self.home / ".docker" / "config.json",
-            ],
-            "npm": [
-                self.home / ".npmrc",
-            ],
-            "code": [
-                self.xdg_config / "Code" / "User" / "settings.json",
-                self.xdg_config / "Code" / "User" / "keybindings.json",
-            ],
-            "vscode": [
-                self.xdg_config / "Code" / "User" / "settings.json",
-                self.xdg_config / "Code" / "User" / "keybindings.json",
-            ],
-            "opencode": [
-                self.xdg_config / "opencode" / "settings.json",
-            ],
+        found.add(path_str)
+        return [(path_str, size)]
+
+    def _is_config_file(self, path: Path) -> bool:
+        try:
+            if not path.is_file():
+                return False
+            size = path.stat().st_size
+        except OSError:
+            return False
+
+        if size > self.MAX_FILE_SIZE:
+            return False
+        if any(self._is_excluded_dir_name(part) for part in path.parts[:-1]):
+            return False
+
+        suffix = path.suffix.lower()
+        name = path.name.lower()
+
+        if name in self.EXCLUDED_FILE_NAMES:
+            return False
+        if suffix in self.EXCLUDED_SUFFIXES:
+            return False
+        if any(part in name for part in self.EXCLUDED_NAME_PARTS):
+            return False
+
+        if suffix in self.ALLOWED_EXTENSIONS:
+            return True
+
+        if name in {
+            "config",
+            "settings",
+            "preferences",
+            "prefs.js",
+            "bookmarks",
+            "known_hosts",
+            "authorized_keys",
+            "config.json",
+            "settings.json",
+            "keybindings.json",
+            "init.lua",
+            "init.vim",
+            "kitty.conf",
+            "alacritty.toml",
+            "alacritty.yml",
+            "registry.vdf",
+            "localconfig.vdf",
+        }:
+            return True
+
+        if name.startswith(".") and self._looks_like_text(path):
+            return True
+
+        return False
+
+    def _is_global_config_file(self, path: Path) -> bool:
+        try:
+            if not path.is_file():
+                return False
+            size = path.stat().st_size
+        except OSError:
+            return False
+
+        if size > self.MAX_FILE_SIZE:
+            return False
+        if any(self._is_excluded_dir_name(part) for part in path.parts[:-1]):
+            return False
+
+        suffix = path.suffix.lower()
+        return suffix in {
+            ".conf",
+            ".cfg",
+            ".ini",
+            ".json",
+            ".jsonc",
+            ".toml",
+            ".yaml",
+            ".yml",
+            ".xml",
+            ".desktop",
+            ".theme",
+            ".css",
+            ".scss",
+            ".svg",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".ico",
+            ".ttf",
+            ".otf",
+            ".woff",
+            ".woff2",
         }
 
-        if app_name in app_configs:
-            for path in app_configs[app_name]:
-                if path.exists() and path.is_file():
-                    path_str = str(path)
-                    if path_str not in found_paths:
-                        size = path.stat().st_size
-                        if size < 10 * 1024 * 1024:
-                            configs.append((path_str, size))
-                            found_paths.add(path_str)
+    def _collect_referenced_paths(
+        self, path: Path, found: Set[str]
+    ) -> List[ConfigEntry]:
+        if not self._supports_reference_parsing(path):
+            return []
 
-        return configs
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return []
 
-    def get_user_configs_summary(self) -> Dict[str, List[Tuple[str, int]]]:
-        """Get all user configs organized by category"""
-        all_configs = {}
+        patterns = [
+            r"^\s*source\s+['\"]?([^'\"\n]+)",
+            r"^\s*\.\s+['\"]?([^'\"\n]+)",
+            r"^\s*include\s+['\"]?([^'\"\n]+)",
+            r"^\s*include-file\s+['\"]?([^'\"\n]+)",
+        ]
 
-        # Shell configs
-        shell_configs = []
-        shell_configs.extend(self.discover_configs("zsh"))
-        shell_configs.extend(self.discover_configs("bash"))
-        shell_configs.extend(self.discover_configs("fish"))
-        if shell_configs:
-            all_configs["shells"] = shell_configs
+        referenced: List[ConfigEntry] = []
+        for pattern in patterns:
+            for match in re.findall(pattern, content, flags=re.MULTILINE):
+                candidate = match.strip().strip("\"'")
+                if not candidate or candidate.startswith("$"):
+                    continue
+                for resolved in self._resolve_reference(path.parent, candidate):
+                    referenced.extend(self._collect_from_path(resolved, found))
 
-        # Editor configs
-        editor_configs = []
-        editor_configs.extend(self.discover_configs("nvim"))
-        editor_configs.extend(self.discover_configs("neovim"))
-        editor_configs.extend(self.discover_configs("vim"))
-        editor_configs.extend(self.discover_configs("code"))
-        editor_configs.extend(self.discover_configs("vscode"))
-        if editor_configs:
-            all_configs["editors"] = editor_configs
+        return referenced
 
-        # Terminal configs
-        terminal_configs = []
-        terminal_configs.extend(self.discover_configs("kitty"))
-        terminal_configs.extend(self.discover_configs("alacritty"))
-        terminal_configs.extend(self.discover_configs("terminator"))
-        if terminal_configs:
-            all_configs["terminals"] = terminal_configs
+    def _resolve_reference(self, base_dir: Path, candidate: str) -> List[Path]:
+        expanded = os.path.expandvars(candidate)
+        expanded = os.path.expanduser(expanded)
+        target = Path(expanded)
+        if not target.is_absolute():
+            target = (base_dir / target).resolve()
 
-        # CLI tool configs
-        cli_configs = []
-        cli_configs.extend(self.discover_configs("fzf"))
-        cli_configs.extend(self.discover_configs("zoxide"))
-        cli_configs.extend(self.discover_configs("git"))
-        cli_configs.extend(self.discover_configs("ssh"))
-        cli_configs.extend(self.discover_configs("cargo"))
-        cli_configs.extend(self.discover_configs("rustup"))
-        if cli_configs:
-            all_configs["cli_tools"] = cli_configs
+        if any(char in str(target) for char in "*?["):
+            return [
+                Path(path)
+                for path in glob.glob(str(target), recursive=True)
+                if Path(path).exists()
+            ]
 
-        return all_configs
+        try:
+            return [target] if target.exists() else []
+        except OSError:
+            return []
 
-    def get_global_configs(self) -> List[Tuple[str, int]]:
-        """Get global/user configs like themes, icons, fonts"""
-        configs = []
-        found_paths: Set[str] = set()
-        home = Path.home()
+    def _supports_reference_parsing(self, path: Path) -> bool:
+        suffix = path.suffix.lower()
+        if suffix in {
+            ".conf",
+            ".cfg",
+            ".ini",
+            ".toml",
+            ".yaml",
+            ".yml",
+            ".lua",
+            ".vim",
+            ".rc",
+        }:
+            return True
+        return path.name.lower() in {
+            ".zshrc",
+            ".bashrc",
+            ".profile",
+            ".bash_profile",
+            "kitty.conf",
+            "alacritty.toml",
+            "alacritty.yml",
+            "config",
+        }
 
-        # Themes
-        themes_dir = home / ".themes"
-        if themes_dir.exists():
-            # Only get theme directories, not all files
-            for theme_dir in themes_dir.iterdir():
-                if theme_dir.is_dir():
-                    # Get CSS/config files from theme
-                    for config_file in ["gtk.css", "gtk-dark.css", "index.theme"]:
-                        config_path = theme_dir / config_file
-                        if config_path.exists() and config_path.is_file():
-                            path_str = str(config_path)
-                            if path_str not in found_paths:
-                                size = config_path.stat().st_size
-                                if size < 10 * 1024 * 1024:
-                                    configs.append((path_str, size))
-                                    found_paths.add(path_str)
+    def _looks_like_text(self, path: Path) -> bool:
+        try:
+            with path.open("rb") as handle:
+                chunk = handle.read(self.MAX_TEXT_PROBE)
+        except OSError:
+            return False
 
-        # Icons
-        icons_dir = home / ".icons"
-        if icons_dir.exists():
-            # Only get icon theme index files
-            for icon_dir in icons_dir.iterdir():
-                if icon_dir.is_dir():
-                    index_file = icon_dir / "index.theme"
-                    if index_file.exists():
-                        path_str = str(index_file)
-                        if path_str not in found_paths:
-                            size = index_file.stat().st_size
-                            configs.append((path_str, size))
-                            found_paths.add(path_str)
+        if b"\x00" in chunk:
+            return False
 
-        # Fonts
-        fonts_dir = home / ".fonts"
-        if fonts_dir.exists():
-            # Don't backup actual font files (too big), just fontconfig
-            fontconfig_dir = home / ".config" / "fontconfig"
-            if fontconfig_dir.exists():
-                for item in fontconfig_dir.rglob("*"):
-                    if item.is_file() and item.suffix in [".conf", ".xml"]:
-                        path_str = str(item)
-                        if path_str not in found_paths:
-                            size = item.stat().st_size
-                            if size < 10 * 1024 * 1024:
-                                configs.append((path_str, size))
-                                found_paths.add(path_str)
+        try:
+            chunk.decode("utf-8")
+            return True
+        except UnicodeDecodeError:
+            try:
+                chunk.decode("latin-1")
+                return True
+            except UnicodeDecodeError:
+                return False
 
-        # Desktop entries (custom .desktop files)
-        apps_dir = home / ".local" / "share" / "applications"
-        if apps_dir.exists():
-            for desktop_file in apps_dir.glob("*.desktop"):
-                path_str = str(desktop_file)
-                if path_str not in found_paths:
-                    size = desktop_file.stat().st_size
-                    configs.append((path_str, size))
-                    found_paths.add(path_str)
+    def _is_excluded_dir(self, path: Path) -> bool:
+        return self._is_excluded_dir_name(path.name)
 
-        return configs
+    def _is_excluded_dir_name(self, name: str) -> bool:
+        return (
+            name.lower() in self.EXCLUDED_DIRS
+            or self._normalize(name) in self.EXCLUDED_DIRS
+        )
 
-
-if __name__ == "__main__":
-    discovery = SmartConfigDiscovery()
-
-    # Test
-    test_apps = [
-        "zsh",
-        "fzf",
-        "kitty",
-        "bash",
-        "git",
-        "nvim",
-        "code",
-        "cargo",
-        "rustup",
-    ]
-
-    print("Smart Config Discovery - ONLY Config Files")
-    print("=" * 70)
-
-    for app in test_apps:
-        configs = discovery.discover_configs(app)
-        if configs:
-            total_size = sum(size for _, size in configs)
-            print(f"\n{app}: {len(configs)} files ({total_size / 1024:.1f} KB)")
-            for path, size in configs:
-                print(f"  - {path} ({size / 1024:.1f} KB)")
+    @staticmethod
+    def _normalize(value: str) -> str:
+        cleaned = value.lower().replace("_", " ").replace("-", " ").replace(".", " ")
+        return " ".join(cleaned.split())

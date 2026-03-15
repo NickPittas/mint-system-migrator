@@ -116,15 +116,14 @@ class ConfigBackup:
 
             if include_global:
                 self.progress(10, "Discovering global configs...")
-                global_configs = []
-
-                # Get global configs using discovery
-                global_summary = discovery.get_user_configs_summary()
-                for category, configs in global_summary.items():
-                    for path, size in configs:
-                        if path not in global_configs:
-                            global_configs.append(path)
-
+                app_specific_paths = {
+                    path for app_paths in all_configs.values() for path in app_paths
+                }
+                global_configs = [
+                    path
+                    for path, _ in discovery.get_global_configs()
+                    if path not in app_specific_paths
+                ]
                 if global_configs:
                     all_configs["_global"] = global_configs
                     self.log(f"  Global: {len(global_configs)} files")
@@ -175,12 +174,17 @@ class ConfigBackup:
                 "applications": list(all_configs.keys()),
                 "total_apps": len(all_configs),
                 "apps_without_configs": apps_without_configs,
+                "config_paths_by_app": all_configs,
                 "total_size_bytes": total_size,
                 "version": "2.0",
             }
 
-            metadata_path = backup_dir / "metadata.json"
+            metadata_path = backup_dir / "backup_manifest.json"
             with open(metadata_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+
+            compatibility_metadata_path = backup_dir / "backup_metadata.json"
+            with open(compatibility_metadata_path, "w") as f:
                 json.dump(metadata, f, indent=2)
 
             result.backed_up_files.append(str(metadata_path))
