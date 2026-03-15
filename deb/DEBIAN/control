@@ -1,0 +1,12 @@
+Package: mint-system-migrator
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, python3-pip, python3-venv
+Maintainer: Nick Pittas <nick@example.com>
+Description: Linux Mint System Migration Tool
+ Backup and restore applications and configurations
+ when migrating to a new Linux Mint system.
+ Features app scanning, config backup, and restore
+ with dry-run support.

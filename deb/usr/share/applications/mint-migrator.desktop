@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Mint System Migrator
+Comment=Backup and restore Linux Mint applications and configs
+Exec=mint-migrator
+Icon=system-software-install
+Type=Application
+Categories=System;Settings;
+Terminal=false
+StartupNotify=true

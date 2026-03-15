@@ -1,0 +1,20 @@
+#!/bin/bash
+# Post-installation script
+
+echo "Setting up Mint System Migrator..."
+
+APP_DIR="/usr/share/mint-migrator"
+VENV_DIR="$APP_DIR/venv"
+
+# Create virtual environment
+cd "$APP_DIR"
+python3 -m venv venv
+
+# Install PyQt6
+source venv/bin/activate
+pip install --quiet PyQt6
+
+echo "✓ Installation complete!"
+echo ""
+echo "Run with: mint-migrator"
+echo "Or find it in your applications menu."
