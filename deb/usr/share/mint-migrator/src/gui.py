@@ -133,12 +133,17 @@ class RestoreThread(QThread):
     finished_signal = pyqtSignal(bool, object)
 
     def __init__(
-        self, package_path: Path, selected_apps: list = None, dry_run: bool = False
+        self,
+        package_path: Path,
+        selected_apps: list = None,
+        dry_run: bool = False,
+        staged_restore_root: Path | None = None,
     ):
         super().__init__()
         self.package_path = package_path
         self.selected_apps = selected_apps
         self.dry_run = dry_run
+        self.staged_restore_root = staged_restore_root
         self.restorer = None
 
     def run(self):
@@ -155,6 +160,7 @@ class RestoreThread(QThread):
             result = self.restorer.restore(
                 package_path=self.package_path,
                 selected_apps=self.selected_apps,
+                staged_restore_root=self.staged_restore_root,
             )
             self.finished_signal.emit(result.success, result)
         except Exception as e:
@@ -505,6 +511,13 @@ class MainWindow(QMainWindow):
             "Show what would be installed without making changes"
         )
         options_layout.addWidget(self.chk_dry_run)
+
+        self.chk_stage_restore = QCheckBox("Safe staged restore to folder")
+        self.chk_stage_restore.setChecked(False)
+        self.chk_stage_restore.setToolTip(
+            "Restore configs into a separate folder instead of your real home directory"
+        )
+        options_layout.addWidget(self.chk_stage_restore)
 
         layout.addWidget(options_group)
 
@@ -912,12 +925,33 @@ Click 'Scan System' to begin.""")
         dry_run = (
             self.chk_dry_run.isChecked() if hasattr(self, "chk_dry_run") else False
         )
+        staged_restore_root = None
+        staged_restore = (
+            self.chk_stage_restore.isChecked()
+            if hasattr(self, "chk_stage_restore")
+            else False
+        )
+        if staged_restore:
+            staged_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Choose staged restore folder",
+                str(Path.home() / "MintRestorePreview"),
+            )
+            if not staged_dir:
+                return
+            staged_restore_root = Path(staged_dir)
+
         mode_str = "[DRY-RUN] " if dry_run else ""
+        staged_note = (
+            "\n\nStaged restore mode will restore configs into a separate folder and will not install apps, add repos, or enable services."
+            if staged_restore_root
+            else ""
+        )
 
         reply = QMessageBox.question(
             self,
             f"{mode_str}Confirm Restore",
-            f"{mode_str}This will install {len(selected_apps)} applications, add repositories, and restore configs.\n\nContinue?",
+            f"{mode_str}This will install {len(selected_apps)} applications, add repositories, and restore configs.{staged_note}\n\nContinue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
 
@@ -939,6 +973,7 @@ Click 'Scan System' to begin.""")
             package_path=package_path,
             selected_apps=selected_app_names,
             dry_run=dry_run,
+            staged_restore_root=staged_restore_root,
         )
         self.restore_thread.progress.connect(self.on_restore_progress)
         self.restore_thread.log.connect(self.terminal.log)
@@ -964,6 +999,8 @@ Click 'Scan System' to begin.""")
             self.terminal.log(f"  Repos: {len(result.added_repos)}")
             self.terminal.log(f"  Configs: {len(result.restored_configs)}")
             self.terminal.log(f"  Services: {len(result.enabled_services)}")
+            if getattr(result, "staged_restore_root", None):
+                self.terminal.log(f"  Staged to: {result.staged_restore_root}", "info")
 
             if result.failed_apps:
                 self.terminal.log(f"  Failed: {len(result.failed_apps)}")
@@ -975,7 +1012,12 @@ Click 'Scan System' to begin.""")
                 f"Installed: {len(result.installed_apps)}\n"
                 f"Repositories: {len(result.added_repos)}\n"
                 f"Configs: {len(result.restored_configs)}\n"
-                f"Services: {len(result.enabled_services)}",
+                f"Services: {len(result.enabled_services)}"
+                + (
+                    f"\nStaged to: {result.staged_restore_root}"
+                    if getattr(result, "staged_restore_root", None)
+                    else ""
+                ),
             )
         else:
             self.terminal.log("\n✗ Restore failed!", "error")
@@ -1003,6 +1045,19 @@ Click 'Scan System' to begin.""")
         file_path = getattr(self, "_last_package_path", "unknown")
 
         if success and result:
+            if result.archive_path and file_path != "unknown":
+                try:
+                    with open(file_path, "r") as handle:
+                        package_data = json.load(handle)
+                    package_data["config_archive_name"] = result.archive_path.name
+                    package_data["config_archive_path"] = str(result.archive_path)
+                    with open(file_path, "w") as handle:
+                        json.dump(package_data, handle, indent=2)
+                except Exception as e:
+                    self.terminal.log(
+                        f"⚠ Failed to update package metadata with config archive: {e}",
+                        "warning",
+                    )
             self.terminal.log(
                 f"\n✓ Config backup complete: {result.archive_path}", "success"
             )

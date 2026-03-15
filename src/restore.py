@@ -5,14 +5,21 @@ Handles apt packages, flatpak apps, configs, repositories, and services
 """
 
 import os
+import base64
 import json
 import shutil
 import tarfile
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
+
+try:
+    from .config_backup import ConfigBackup
+except ImportError:
+    from config_backup import ConfigBackup
 
 
 @dataclass
@@ -28,6 +35,7 @@ class RestoreResult:
     enabled_services: List[str] = field(default_factory=list)
     error_message: str = ""
     dry_run: bool = False
+    staged_restore_root: Optional[str] = None
 
 
 class AppRestorer:
@@ -50,6 +58,32 @@ class AppRestorer:
         if self.progress_callback:
             self.progress_callback(percent, message)
         self.log(message)
+
+    def _run_privileged(
+        self, command: List[str], input_text: Optional[str] = None
+    ) -> subprocess.CompletedProcess:
+        runners = []
+        if shutil.which("pkexec"):
+            runners.append(["pkexec", *command])
+        runners.append(["sudo", *command])
+
+        last_error = None
+        for runner in runners:
+            try:
+                result = subprocess.run(
+                    runner,
+                    input=input_text,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                return result
+            except Exception as e:
+                last_error = e
+
+        raise RuntimeError(
+            str(last_error) if last_error else "No privileged runner available"
+        )
 
     def check_package_available(self, package_name: str, install_method: str) -> bool:
         """Check if a package is available in repositories"""
@@ -83,12 +117,7 @@ class AppRestorer:
             # Update package list first
             self.log(f"  Installing {package_name}...")
 
-            result = subprocess.run(
-                ["sudo", "apt-get", "install", "-y", package_name],
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
+            result = self._run_privileged(["apt-get", "install", "-y", package_name])
 
             if result.returncode == 0:
                 return True, "Installed successfully"
@@ -139,22 +168,53 @@ class AppRestorer:
 
                 self.log(f"  Adding repository: {repo['name']}")
 
-                # Build repository line
-                components = " ".join(repo.get("components", ["main"]))
-                repo_line = (
-                    f"deb {repo['url']} {repo.get('codename', 'stable')} {components}"
-                )
+                repo_line = repo.get("source_line", "").strip()
+                if not repo_line:
+                    suite = repo.get("suite") or repo.get("codename")
+                    components = repo.get("components", [])
+                    if not repo.get("url") or not suite:
+                        return False, "Repository data incomplete for restore"
+                    repo_line = (
+                        f"deb {repo['url']} {suite} {' '.join(components)}".strip()
+                    )
 
-                if repo.get("key_file"):
-                    repo_line += f" [signed-by={repo['key_file']}]"
+                key_file = repo.get("key_file")
+                key_content = repo.get("key_file_content_base64")
+                if key_file and key_content:
+                    key_bytes = base64.b64decode(key_content)
+                    with tempfile.NamedTemporaryFile(delete=False) as temp_key:
+                        temp_key.write(key_bytes)
+                        temp_key_path = temp_key.name
+                    try:
+                        self._run_privileged(
+                            ["mkdir", "-p", str(Path(key_file).parent)]
+                        )
+                        install_key = self._run_privileged(
+                            ["install", "-m", "644", temp_key_path, key_file]
+                        )
+                        if install_key.returncode != 0:
+                            return False, install_key.stderr[:200]
+                    finally:
+                        Path(temp_key_path).unlink(missing_ok=True)
+                elif key_file and not Path(key_file).exists():
+                    return False, f"Repository key missing for {repo['name']}"
 
-                # Write to sources.list.d
-                repo_file.write_text(repo_line + "\n")
+                with tempfile.NamedTemporaryFile("w", delete=False) as temp_repo:
+                    temp_repo.write(repo_line + "\n")
+                    temp_repo_path = temp_repo.name
+                try:
+                    install_repo = self._run_privileged(
+                        ["install", "-m", "644", temp_repo_path, str(repo_file)]
+                    )
+                    if install_repo.returncode != 0:
+                        return False, install_repo.stderr[:200]
+                finally:
+                    Path(temp_repo_path).unlink(missing_ok=True)
 
                 # Update apt
-                subprocess.run(
-                    ["sudo", "apt-get", "update"], capture_output=True, timeout=60
-                )
+                update_result = self._run_privileged(["apt-get", "update"])
+                if update_result.returncode != 0:
+                    return False, update_result.stderr[:200]
 
                 return True, "Repository added"
 
@@ -201,23 +261,13 @@ class AppRestorer:
             self.log(f"  Enabling service: {service_name}")
 
             # Enable service
-            result = subprocess.run(
-                ["sudo", "systemctl", "enable", service_name],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            result = self._run_privileged(["systemctl", "enable", service_name])
 
             if result.returncode != 0:
                 return False, result.stderr[:200]
 
             # Start service
-            result = subprocess.run(
-                ["sudo", "systemctl", "start", service_name],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            result = self._run_privileged(["systemctl", "start", service_name])
 
             if result.returncode == 0:
                 return True, "Service enabled and started"
@@ -252,6 +302,28 @@ class MigrationRestorer:
         if self.progress_callback:
             self.progress_callback(percent, message)
         self.log(message)
+
+    def _find_config_archive(self, package_path: Path, data: Dict) -> Optional[Path]:
+        candidates: List[Path] = []
+
+        if data.get("config_archive_name"):
+            candidates.append(package_path.parent / data["config_archive_name"])
+
+        candidates.append(package_path.parent / f"{package_path.stem}_configs.tar.gz")
+
+        for pattern in ("mint_configs_*.tar.gz", "mint_migration_configs_*.tar.gz"):
+            candidates.extend(
+                sorted(
+                    package_path.parent.glob(pattern),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+            )
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
 
     def load_migration_package(self, package_path: Path) -> Optional[Dict]:
         """Load and validate migration package"""
@@ -293,6 +365,7 @@ class MigrationRestorer:
         restore_configs: bool = True,
         add_repos: bool = True,
         enable_services: bool = True,
+        staged_restore_root: Optional[Path] = None,
     ) -> RestoreResult:
         """
         Restore from migration package
@@ -308,7 +381,13 @@ class MigrationRestorer:
         Returns:
             RestoreResult with details of the operation
         """
-        result = RestoreResult(success=False, dry_run=self.dry_run)
+        result = RestoreResult(
+            success=False,
+            dry_run=self.dry_run,
+            staged_restore_root=str(staged_restore_root)
+            if staged_restore_root
+            else None,
+        )
 
         try:
             # Load package
@@ -321,6 +400,15 @@ class MigrationRestorer:
             self.log("")
             self.log(f"{mode_str}Starting restoration...")
             self.log("=" * 60)
+
+            if staged_restore_root:
+                install_apps = False
+                add_repos = False
+                enable_services = False
+                self.log(
+                    f"Staged restore mode: restoring configs into {staged_restore_root}"
+                )
+                self.log("System changes are disabled in staged restore mode")
 
             # Add repositories first
             if add_repos and data.get("repositories"):
@@ -348,6 +436,9 @@ class MigrationRestorer:
                 total_apps = len(apps)
                 self.log("")
                 self.log(f"Installing {total_apps} applications...")
+
+                if total_apps == 0:
+                    self.log("No applications selected for restore")
 
                 for i, app in enumerate(apps):
                     if not app.get("selected", True):
@@ -384,7 +475,7 @@ class MigrationRestorer:
                     elif install_method == "flatpak":
                         success, msg = self.app_restorer.install_flatpak(install_source)
                     else:
-                        success, False
+                        success = False
                         msg = f"Unknown install method: {install_method}"
 
                     if success:
@@ -404,33 +495,19 @@ class MigrationRestorer:
                 self.progress(75, "Restoring configurations...")
 
                 # Look for companion config archive
-                config_archive = (
-                    package_path.parent / f"{package_path.stem}_configs.tar.gz"
-                )
-                if not config_archive.exists():
-                    # Try alternative naming
-                    config_archive = (
-                        package_path.parent / "mint_migration_configs_*.tar.gz"
-                    )
-                    import glob
-
-                    matches = glob.glob(str(config_archive))
-                    if matches:
-                        config_archive = Path(matches[-1])  # Use most recent
-                    else:
-                        config_archive = None
+                config_archive = self._find_config_archive(package_path, data)
 
                 if config_archive and config_archive.exists():
                     self.log(f"Found config archive: {config_archive.name}")
-
-                    # Import config backup module
-                    from config_backup import ConfigBackup
 
                     backup = ConfigBackup()
                     backup.set_callbacks(self.progress_callback, self.log_callback)
 
                     config_result = backup.restore_configs(
-                        config_archive, dry_run=self.dry_run
+                        config_archive,
+                        dry_run=self.dry_run,
+                        selected_apps=selected_apps,
+                        restore_root=staged_restore_root,
                     )
 
                     result.restored_configs = config_result.backed_up_files

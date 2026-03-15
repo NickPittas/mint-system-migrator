@@ -12,6 +12,10 @@ rm -rf deb/usr/share/mint-migrator/src
 cp -r src deb/usr/share/mint-migrator/
 cp README.md deb/usr/share/mint-migrator/
 
+# Clean Python cache artifacts from packaged source
+find deb/usr/share/mint-migrator/src -type d -name '__pycache__' -prune -exec rm -rf {} +
+find deb/usr/share/mint-migrator/src -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+
 # Calculate installed size
 INSTALLED_SIZE=$(du -sk deb/usr | cut -f1)
 
@@ -36,10 +40,10 @@ if [ $? -eq 0 ]; then
     echo "File: $OUTPUT_FILE"
     echo ""
     echo "To install:"
-    echo "  sudo dpkg -i $OUTPUT_FILE"
+    echo "  sudo apt install ./$OUTPUT_FILE"
     echo ""
     echo "To upgrade (no need to remove first):"
-    echo "  sudo dpkg -i $OUTPUT_FILE"
+    echo "  sudo apt install ./$OUTPUT_FILE"
     echo ""
     echo "To uninstall:"
     echo "  sudo apt remove mint-system-migrator"

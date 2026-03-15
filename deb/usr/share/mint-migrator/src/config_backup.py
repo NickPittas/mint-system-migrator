@@ -293,6 +293,148 @@ class ConfigBackup:
                 pass
             return result
 
+    def restore_configs(
+        self,
+        archive_path: Path,
+        dry_run: bool = False,
+        selected_apps: Optional[List[str]] = None,
+        restore_root: Optional[Path] = None,
+    ) -> ConfigBackupResult:
+        """Restore config files from a backup archive."""
+        result = ConfigBackupResult(success=False)
+        self.cancelled = False
+        extract_dir = None
+
+        try:
+            self.progress(0, "Preparing config restore...")
+
+            if not archive_path.exists():
+                result.error_message = f"Archive not found: {archive_path}"
+                return result
+
+            extract_dir = (
+                Path("/tmp")
+                / f"mint_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            extract_dir.mkdir(parents=True, exist_ok=True)
+
+            self.progress(10, "Extracting config archive...")
+            with tarfile.open(archive_path, "r:gz") as tar:
+                self._safe_extract(tar, extract_dir)
+
+            extracted_roots = [item for item in extract_dir.iterdir() if item.is_dir()]
+            if not extracted_roots:
+                result.error_message = (
+                    "Archive did not contain an extracted backup directory"
+                )
+                return result
+
+            backup_root = extracted_roots[0]
+            manifest = self._load_manifest(backup_root)
+            if not manifest:
+                result.error_message = "Backup manifest not found in archive"
+                return result
+
+            selected_set = {app.lower() for app in selected_apps or []}
+            destination_root = restore_root if restore_root else Path.home()
+            config_paths_by_app = manifest.get("config_paths_by_app", {})
+            if not config_paths_by_app:
+                result.error_message = "Archive manifest does not contain config paths"
+                return result
+
+            restore_targets: List[Tuple[str, Path, Path]] = []
+            for app_name, original_paths in config_paths_by_app.items():
+                if (
+                    selected_set
+                    and app_name != "_global"
+                    and app_name.lower() not in selected_set
+                ):
+                    continue
+
+                for original_path_str in original_paths:
+                    original_path = Path(original_path_str)
+                    try:
+                        relative_path = original_path.relative_to(Path.home())
+                    except ValueError:
+                        relative_path = Path(original_path.name)
+
+                    archived_file = backup_root / app_name / relative_path
+                    if not archived_file.exists() or not archived_file.is_file():
+                        result.failed_files.append(
+                            (
+                                original_path_str,
+                                f"Archived file missing: {archived_file}",
+                            )
+                        )
+                        continue
+
+                    destination = destination_root / relative_path
+                    restore_targets.append((app_name, archived_file, destination))
+
+            if not restore_targets:
+                result.error_message = "No restorable config files found in archive"
+                return result
+
+            self.progress(20, "Restoring config files...")
+            backup_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            for index, (app_name, archived_file, destination) in enumerate(
+                restore_targets, start=1
+            ):
+                if self.cancelled:
+                    result.error_message = "Cancelled by user"
+                    return result
+
+                progress = 20 + int((index / len(restore_targets)) * 75)
+                self.progress(progress, f"Restoring {destination.name}...")
+
+                if dry_run:
+                    result.backed_up_files.append(str(destination))
+                    continue
+
+                try:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+
+                    if destination.exists() and destination.is_file():
+                        backup_copy = destination.with_name(
+                            f"{destination.name}.mint-migrator-backup-{backup_suffix}"
+                        )
+                        shutil.copy2(destination, backup_copy)
+
+                    shutil.copy2(archived_file, destination)
+                    result.backed_up_files.append(str(destination))
+                    result.total_size += archived_file.stat().st_size
+                except (PermissionError, OSError, shutil.Error) as e:
+                    result.failed_files.append((str(destination), str(e)))
+
+            result.success = True
+            self.progress(100, "Config restore complete!")
+            return result
+
+        except Exception as e:
+            result.error_message = str(e)
+            self.log(f"✗ Config restore failed: {e}")
+            return result
+        finally:
+            if extract_dir and extract_dir.exists():
+                shutil.rmtree(extract_dir, ignore_errors=True)
+
+    def _load_manifest(self, backup_root: Path) -> Optional[Dict]:
+        for manifest_name in ("backup_manifest.json", "backup_metadata.json"):
+            manifest_path = backup_root / manifest_name
+            if manifest_path.exists():
+                with open(manifest_path, "r") as handle:
+                    return json.load(handle)
+        return None
+
+    def _safe_extract(self, tar: tarfile.TarFile, destination: Path) -> None:
+        destination = destination.resolve()
+        for member in tar.getmembers():
+            member_path = (destination / member.name).resolve()
+            if not str(member_path).startswith(str(destination)):
+                raise ValueError(f"Unsafe archive path: {member.name}")
+        tar.extractall(destination)
+
     def _format_size(self, size_bytes: int) -> str:
         """Format bytes to human readable string"""
         size = float(size_bytes)

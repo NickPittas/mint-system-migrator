@@ -17,11 +17,11 @@ A PyQt6 GUI application to scan, backup, and restore Linux Mint system configura
 ```bash
 # Download the .deb from releases
 cd ~/Downloads
-sudo dpkg -i mint-system-migrator_1.0.0_all.deb
+sudo apt install ./mint-system-migrator_1.0.3_all.deb
 
 # Or install from GitHub release
-wget https://github.com/NickPittas/mint-system-migrator/releases/download/v1.0.0/mint-system-migrator_1.0.0_all.deb
-sudo dpkg -i mint-system-migrator_1.0.0_all.deb
+wget https://github.com/NickPittas/mint-system-migrator/releases/download/v1.0.3/mint-system-migrator_1.0.3_all.deb
+sudo apt install ./mint-system-migrator_1.0.3_all.deb
 ```
 
 The app will appear in your applications menu under **System Tools**.
@@ -78,7 +78,8 @@ mint-migrator
 2. Click "1️⃣ Load Package" to select your migration JSON
 3. Select apps to restore
 4. (Optional) Check "Dry run" to preview
-5. Click "3️⃣ Restore Selected"
+5. (Optional) Check "Safe staged restore to folder" to restore into a preview folder instead of your real home
+6. Click "3️⃣ Restore Selected"
 
 ## What Gets Backed Up
 

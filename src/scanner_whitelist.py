@@ -5,6 +5,7 @@ This is more reliable than trying to filter out system packages
 """
 
 import subprocess
+import base64
 import json
 from pathlib import Path
 from typing import Set, List, Dict, Optional, Tuple
@@ -35,6 +36,32 @@ class Application:
             "category": self.category,
             "selected": self.selected,
             "config_paths": self.config_paths,
+        }
+
+
+@dataclass
+class Repository:
+    type: str
+    name: str
+    url: str
+    components: List[str] = field(default_factory=list)
+    suite: str = ""
+    source_line: str = ""
+    key_file: Optional[str] = None
+    key_file_content_base64: Optional[str] = None
+    enabled: bool = True
+
+    def to_dict(self):
+        return {
+            "type": self.type,
+            "name": self.name,
+            "url": self.url,
+            "components": self.components,
+            "suite": self.suite,
+            "source_line": self.source_line,
+            "key_file": self.key_file,
+            "key_file_content_base64": self.key_file_content_base64,
+            "enabled": self.enabled,
         }
 
 
@@ -684,38 +711,39 @@ class WhitelistSystemScanner:
                     line = line.strip()
                     if line.startswith("deb ") and not line.startswith("#"):
                         parts = line.split()
-                        if len(parts) >= 3:
-                            url = parts[1]
+                        if len(parts) >= 4:
+                            url_index = 1
+                            if parts[1].startswith("["):
+                                url_index = 2
+                            if len(parts) <= url_index + 1:
+                                continue
+
+                            url = parts[url_index]
+                            suite = parts[url_index + 1]
+                            components = parts[url_index + 2 :]
+
                             key_file = None
+                            key_file_content_base64 = None
                             if "signed-by=" in line:
                                 match = re.search(r"signed-by=([^\s\]]+)", line)
                                 if match:
                                     key_file = match.group(1)
-
-                            from dataclasses import dataclass, field
-
-                            @dataclass
-                            class Repository:
-                                type: str
-                                name: str
-                                url: str
-                                components: List[str] = field(default_factory=list)
-                                key_file: Optional[str] = None
-                                enabled: bool = True
-
-                                def to_dict(self):
-                                    return {
-                                        "type": self.type,
-                                        "name": self.name,
-                                        "url": self.url,
-                                        "components": self.components,
-                                        "key_file": self.key_file,
-                                        "enabled": self.enabled,
-                                    }
+                                    key_path = Path(key_file)
+                                    if key_path.exists() and key_path.is_file():
+                                        key_file_content_base64 = base64.b64encode(
+                                            key_path.read_bytes()
+                                        ).decode("ascii")
 
                             repos.append(
                                 Repository(
-                                    type="apt", name=f.stem, url=url, key_file=key_file
+                                    type="apt",
+                                    name=f.stem,
+                                    url=url,
+                                    components=components,
+                                    suite=suite,
+                                    source_line=line,
+                                    key_file=key_file,
+                                    key_file_content_base64=key_file_content_base64,
                                 )
                             )
 
@@ -731,31 +759,12 @@ class WhitelistSystemScanner:
                 if "\t" in line:
                     parts = line.split("\t")
                     if len(parts) >= 2:
-
-                        @dataclass
-                        class Repository:
-                            type: str
-                            name: str
-                            url: str
-                            components: List[str] = field(default_factory=list)
-                            key_file: Optional[str] = None
-                            enabled: bool = True
-
-                            def to_dict(self):
-                                return {
-                                    "type": self.type,
-                                    "name": self.name,
-                                    "url": self.url,
-                                    "components": self.components,
-                                    "key_file": self.key_file,
-                                    "enabled": self.enabled,
-                                }
-
                         repos.append(
                             Repository(
                                 type="flatpak",
                                 name=parts[0].strip(),
                                 url=parts[1].strip(),
+                                source_line="",
                             )
                         )
         except:
